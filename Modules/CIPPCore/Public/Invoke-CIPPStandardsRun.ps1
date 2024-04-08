@@ -78,7 +78,7 @@ function Invoke-CIPPStandardsRun {
 
     #For each item in our object, run the queue.
 
-    $Batch = foreach ($task in $object | Where-Object -Property Standard -NotLike 'v2*') {
+    $Batch = foreach ($task in $object | Where-Object { $_.Standard -NotLike 'v2*' -and ($_.Settings.remediate -eq $true -or $_.Settings.alert -eq $true -or $_.Settings.report -eq $true) }) {
         [PSCustomObject]@{
             Tenant       = $task.Tenant
             Standard     = $task.Standard
@@ -94,5 +94,5 @@ function Invoke-CIPPStandardsRun {
 
     $InstanceId = Start-NewOrchestration -FunctionName 'CIPPOrchestrator' -InputObject ($InputObject | ConvertTo-Json -Depth 5)
     Write-Host "Started orchestration with ID = '$InstanceId'"
-    $Orchestrator = New-OrchestrationCheckStatusResponse -Request $Request -InstanceId $InstanceId
+    #$Orchestrator = New-OrchestrationCheckStatusResponse -Request $Request -InstanceId $InstanceId
 }
