@@ -37,6 +37,21 @@ Function Invoke-ExecExtensionTest {
                 $token = Get-NinjaOneToken -configuration $Configuration.NinjaOne
                 $Results = [pscustomobject]@{'Results' = 'Succesfully Connected to NinjaOne' }
             }
+            'PWPush' {
+                $Payload = 'This is a test from CIPP'
+                $PasswordLink = New-PwPushLink -Payload $Payload
+                if ($PasswordLink) {
+                    $Results = [pscustomobject]@{'Results' = 'Succesfully generated PWPush'; 'Link' = $PasswordLink }
+                } else {
+                    $Results = [pscustomobject]@{'Results' = 'PWPush is not enabled' }
+                }
+            }
+            'Hudu' {
+                Connect-HuduAPI -configuration $Configuration.Hudu
+                $Version = Get-HuduAppInfo
+                Write-Host ($Version | ConvertTo-Json)
+                $Results = [pscustomobject]@{'Results' = ('Succesfully Connected to Hudu, version: {0}' -f $Version.version) }
+            }
         }
     } catch {
         $Results = [pscustomobject]@{'Results' = "Failed to connect: $($_.Exception.Message) $($_.InvocationInfo.ScriptLineNumber)" }

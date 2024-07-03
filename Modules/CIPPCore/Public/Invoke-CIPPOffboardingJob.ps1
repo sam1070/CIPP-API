@@ -36,7 +36,7 @@ function Invoke-CIPPOffboardingJob {
         }
 
         { $_.'OnedriveAccess' -ne '' } { 
-            $Options.OnedriveAccess | ForEach-Object { Set-CIPPSharePointOwner -tenantFilter $tenantFilter -userid $username -OnedriveAccessUser $_.value -ExecutingUser $ExecutingUser -APIName $APIName }
+            $Options.OnedriveAccess | ForEach-Object { Set-CIPPSharePointPerms -tenantFilter $tenantFilter -userid $username -OnedriveAccessUser $_.value -ExecutingUser $ExecutingUser -APIName $APIName }
         }
 
         { $_.'AccessNoAutomap' -ne '' } { 
@@ -50,7 +50,11 @@ function Invoke-CIPPOffboardingJob {
             Set-CIPPOutOfOffice -tenantFilter $tenantFilter -userid $username -InternalMessage $Options.OOO -ExternalMessage $Options.OOO -ExecutingUser $ExecutingUser -APIName $APIName -state 'Enabled'
         }
         { $_.'forward' -ne '' } { 
-            Set-CIPPForwarding -userid $userid -username $username -tenantFilter $Tenantfilter -Forward $Options.forward -KeepCopy [bool]$Options.keepCopy -ExecutingUser $ExecutingUser -APIName $APIName
+            if (!$options.keepcopy) {
+                Set-CIPPForwarding -userid $userid -username $username -tenantFilter $Tenantfilter -Forward $Options.forward -ExecutingUser $ExecutingUser -APIName $APIName
+            } else {
+                Set-CIPPForwarding -userid $userid -username $username -tenantFilter $Tenantfilter -Forward $Options.forward -KeepCopy $Options.keepCopy -ExecutingUser $ExecutingUser -APIName $APIName
+            }
         }
         { $_.'RemoveLicenses' -eq 'true' } {
             Remove-CIPPLicense -userid $userid -username $Username -tenantFilter $Tenantfilter -ExecutingUser $ExecutingUser -APIName $APIName
