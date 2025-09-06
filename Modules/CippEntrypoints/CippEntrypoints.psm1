@@ -40,7 +40,7 @@ function Receive-CippHttpTrigger {
     $Request = $Request | ConvertTo-Json -Depth 100 | ConvertFrom-Json
     Set-Location (Get-Item $PSScriptRoot).Parent.Parent.FullName
     $FunctionName = 'Invoke-{0}' -f $Request.Params.CIPPEndpoint
-    Write-Information "Function: $($Request.Params.CIPPEndpoint)"
+    Write-Information "API: $($Request.Params.CIPPEndpoint)"
 
     $HttpTrigger = @{
         Request         = [pscustomobject]($Request)
@@ -61,7 +61,7 @@ function Receive-CippHttpTrigger {
                 })
             return
         }
-        
+
         try {
             Write-Information "Access: $Access"
             if ($Access) {
@@ -291,7 +291,7 @@ function Receive-CIPPTimerTrigger {
 
             $Results = Invoke-Command -ScriptBlock { & $Function.Command @Parameters }
             if ($Results -match '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') {
-                $FunctionStatus.OrchestratorId = $Results
+                $FunctionStatus.OrchestratorId = $Results -join ','
                 $Status = 'Started'
             } else {
                 $Status = 'Completed'
