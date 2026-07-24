@@ -4,6 +4,9 @@ function Get-CIPPStandards {
         [string]$TenantFilter = 'allTenants',
 
         [Parameter(Mandatory = $false)]
+        [switch]$LicenseChecks = $false,
+
+        [Parameter(Mandatory = $false)]
         [switch]$ListAllTenants,
 
         [Parameter(Mandatory = $false)]
@@ -19,6 +22,9 @@ function Get-CIPPStandards {
     # 1. Get all JSON-based templates from the "templates" table
     $Table = Get-CippTable -tablename 'templates'
     $Filter = "PartitionKey eq 'StandardsTemplateV2'"
+    # Always load ALL templates so the three-tier merge (AllTenants → Group → Tenant-Specific)
+    # can compute correct precedence. The $TemplateId filter is applied after merge so that
+    # manual runs of a single template don't bypass tenant-specific overrides.
     $Templates = (Get-CIPPAzDataTableEntity @Table -Filter $Filter | Sort-Object TimeStamp).JSON |
         ForEach-Object {
             try {
@@ -28,8 +34,14 @@ function Get-CIPPStandards {
             } catch {}
         } |
         Where-Object {
-            $_.GUID -like $TemplateId -and $_.runManually -eq $runManually
+            $_.runManually -eq $runManually
         }
+
+    if ($TemplateId -ne '*' -and ![string]::IsNullOrEmpty($TemplateId)) {
+        $Templates = $Templates | Where-Object {
+            $_.GUID -like $TemplateId
+        }
+    }
 
     # 1.5. Expand templates that contain TemplateList-Tags into multiple standards
     $ExpandedTemplates = foreach ($Template in $Templates) {
@@ -43,41 +55,58 @@ function Get-CIPPStandards {
             $IsArray = $StandardValue -is [System.Collections.IEnumerable] -and -not ($StandardValue -is [string])
 
             if ($IsArray) {
-                $NewArray = foreach ($Item in $StandardValue) {
-                    if ($Item.'TemplateList-Tags'.value) {
-                        $HasExpansions = $true
-                        $Table = Get-CippTable -tablename 'templates'
-                        $Filter = "PartitionKey eq 'IntuneTemplate'"
-                        $TemplatesList = Get-CIPPAzDataTableEntity @Table -Filter $Filter | Where-Object -Property package -EQ $Item.'TemplateList-Tags'.value
+                $NewArray = @(foreach ($Item in $StandardValue) {
+                        if ($Item.'TemplateList-Tags'.value) {
+                            $HasExpansions = $true
+                            $Table = Get-CippTable -tablename 'templates'
+                            $PartitionKey = switch ($StandardName) {
+                                'ConditionalAccessTemplate' { 'CATemplate' }
+                                'IntuneTemplate' { 'IntuneTemplate' }
+                                default { 'IntuneTemplate' }
+                            }
+                            $Filter = "PartitionKey eq '$PartitionKey'"
+                            $TemplatesList = Get-CIPPAzDataTableEntity @Table -Filter $Filter | Where-Object -Property package -EQ $Item.'TemplateList-Tags'.value
+                            Write-Information "Expanding $StandardName tag '$($Item.'TemplateList-Tags'.value)' from partition '$PartitionKey': found $(@($TemplatesList).Count) templates"
 
-                        foreach ($TemplateItem in $TemplatesList) {
-                            $NewItem = $Item.PSObject.Copy()
-                            $NewItem.PSObject.Properties.Remove('TemplateList-Tags')
-                            $NewItem | Add-Member -NotePropertyName TemplateList -NotePropertyValue ([pscustomobject]@{
-                                    label = "$($TemplateItem.RowKey)"
-                                    value = "$($TemplateItem.RowKey)"
-                                }) -Force
-                            $NewItem | Add-Member -NotePropertyName TemplateId -NotePropertyValue $Template.GUID -Force
-                            $NewItem
+                            foreach ($TemplateItem in $TemplatesList) {
+                                $TemplateJSON = $TemplateItem.JSON | ConvertFrom-Json -Depth 100 -ErrorAction SilentlyContinue
+                                $TemplateLabel = if ($TemplateJSON.displayName) { $TemplateJSON.displayName } else { "$($TemplateItem.RowKey)" }
+                                $NewItem = $Item.PSObject.Copy()
+                                $NewItem.PSObject.Properties.Remove('TemplateList-Tags')
+                                $NewItem | Add-Member -NotePropertyName TemplateList -NotePropertyValue ([pscustomobject]@{
+                                        label = $TemplateLabel
+                                        value = "$($TemplateItem.RowKey)"
+                                    }) -Force
+                                $NewItem | Add-Member -NotePropertyName TemplateId -NotePropertyValue $Template.GUID -Force
+                                $NewItem
+                            }
+                        } else {
+                            $Item | Add-Member -NotePropertyName TemplateId -NotePropertyValue $Template.GUID -Force
+                            $Item
                         }
-                    } else {
-                        $Item | Add-Member -NotePropertyName TemplateId -NotePropertyValue $Template.GUID -Force
-                        $Item
-                    }
+                    })
+                if ($NewArray.Count -gt 0) {
+                    $ExpandedStandards[$StandardName] = $NewArray
                 }
-                $ExpandedStandards[$StandardName] = $NewArray
             } else {
                 if ($StandardValue.'TemplateList-Tags'.value) {
                     $HasExpansions = $true
                     $Table = Get-CippTable -tablename 'templates'
-                    $Filter = "PartitionKey eq 'IntuneTemplate'"
+                    $PartitionKey = switch ($StandardName) {
+                        'ConditionalAccessTemplate' { 'CATemplate' }
+                        'IntuneTemplate' { 'IntuneTemplate' }
+                        default { 'IntuneTemplate' }
+                    }
+                    $Filter = "PartitionKey eq '$PartitionKey'"
                     $TemplatesList = Get-CIPPAzDataTableEntity @Table -Filter $Filter | Where-Object -Property package -EQ $StandardValue.'TemplateList-Tags'.value
 
                     $NewArray = foreach ($TemplateItem in $TemplatesList) {
+                        $TemplateJSON = $TemplateItem.JSON | ConvertFrom-Json -Depth 100 -ErrorAction SilentlyContinue
+                        $TemplateLabel = if ($TemplateJSON.displayName) { $TemplateJSON.displayName } else { "$($TemplateItem.RowKey)" }
                         $NewItem = $StandardValue.PSObject.Copy()
                         $NewItem.PSObject.Properties.Remove('TemplateList-Tags')
                         $NewItem | Add-Member -NotePropertyName TemplateList -NotePropertyValue ([pscustomobject]@{
-                                label = "$($TemplateItem.RowKey)"
+                                label = $TemplateLabel
                                 value = "$($TemplateItem.RowKey)"
                             }) -Force
                         $NewItem | Add-Member -NotePropertyName TemplateId -NotePropertyValue $Template.GUID -Force
@@ -111,7 +140,7 @@ function Get-CIPPStandards {
     # 3. If -ListAllTenants, build standards for "AllTenants" only
     if ($ListAllTenants.IsPresent) {
         $AllTenantsTemplates = $Templates | Where-Object {
-            $_.tenantFilter.value -contains 'AllTenants'
+            $_.tenantFilter.value -contains 'AllTenants' -and $_.GUID -like $TemplateId
         }
 
         foreach ($Template in $AllTenantsTemplates) {
@@ -119,6 +148,7 @@ function Get-CIPPStandards {
 
             foreach ($StandardName in $Standards.PSObject.Properties.Name) {
                 $Value = $Standards.$StandardName
+                if ($null -eq $Value) { continue }
                 $IsArray = $Value -is [System.Collections.IEnumerable] -and -not ($Value -is [string])
 
                 if ($IsArray) {
@@ -240,12 +270,17 @@ function Get-CIPPStandards {
                 }
             }
 
-            # Separate AllTenants vs TenantSpecific templates
+            # Separate templates into three tiers: AllTenants (lowest precedence), Group (middle), Tenant-Specific (highest)
             $AllTenantTemplatesSet = $ApplicableTemplates | Where-Object {
                 $_.tenantFilter.value -contains 'AllTenants'
             }
+            $GroupTemplatesSet = $ApplicableTemplates | Where-Object {
+                ($_.tenantFilter.value -notcontains 'AllTenants') -and
+                ($_.tenantFilter | Where-Object { $_.type -eq 'Group' })
+            }
             $TenantSpecificTemplatesSet = $ApplicableTemplates | Where-Object {
-                $_.tenantFilter.value -notcontains 'AllTenants'
+                ($_.tenantFilter.value -notcontains 'AllTenants') -and
+                -not ($_.tenantFilter | Where-Object { $_.type -eq 'Group' })
             }
 
             # Build merged standards keyed by (StandardName, TemplateList.value)
@@ -257,6 +292,7 @@ function Get-CIPPStandards {
 
                 foreach ($StandardName in $Standards.PSObject.Properties.Name) {
                     $Value = $Standards.$StandardName
+                    if ($null -eq $Value) { continue }
                     $IsArray = $Value -is [System.Collections.IEnumerable] -and -not ($Value -is [string])
 
                     if ($IsArray) {
@@ -283,7 +319,7 @@ function Get-CIPPStandards {
                             $Actions = $CurrentStandard.action.value
                             if ($Actions -contains 'Remediate' -or $Actions -contains 'warn' -or $Actions -contains 'Report') {
                                 # Key by StandardName + TemplateList.value (if present)
-                                $TemplateKey = if ($CurrentStandard.TemplateList.value) { $CurrentStandard.TemplateList.value } else { '' }
+                                $TemplateKey = if ($CurrentStandard.TemplateList.value) { $CurrentStandard.TemplateList.value } elseif ($CurrentStandard.displayName.value) { $CurrentStandard.displayName.value } elseif ($CurrentStandard.displayName) { $CurrentStandard.displayName } else { [guid]::NewGuid().ToString() }
                                 $Key = "$StandardName|$TemplateKey"
 
                                 $ComputedStandards[$Key] = $CurrentStandard
@@ -320,12 +356,13 @@ function Get-CIPPStandards {
                 }
             }
 
-            # Process TenantSpecific templates, merging with AllTenants base
-            foreach ($Template in $TenantSpecificTemplatesSet) {
+            # Process Group templates, merging with AllTenants base
+            foreach ($Template in $GroupTemplatesSet) {
                 $Standards = $Template.standards
 
                 foreach ($StandardName in $Standards.PSObject.Properties.Name) {
                     $Value = $Standards.$StandardName
+                    if ($null -eq $Value) { continue }
                     $IsArray = $Value -is [System.Collections.IEnumerable] -and -not ($Value -is [string])
 
                     if ($IsArray) {
@@ -351,11 +388,11 @@ function Get-CIPPStandards {
 
                             $Actions = $CurrentStandard.action.value
                             if ($Actions -contains 'Remediate' -or $Actions -contains 'warn' -or $Actions -contains 'Report') {
-                                $TemplateKey = if ($CurrentStandard.TemplateList.value) { $CurrentStandard.TemplateList.value } else { '' }
+                                $TemplateKey = if ($CurrentStandard.TemplateList.value) { $CurrentStandard.TemplateList.value } elseif ($CurrentStandard.displayName.value) { $CurrentStandard.displayName.value } elseif ($CurrentStandard.displayName) { $CurrentStandard.displayName } else { [guid]::NewGuid().ToString() }
                                 $Key = "$StandardName|$TemplateKey"
 
                                 if ($ComputedStandards.ContainsKey($Key)) {
-                                    # Merge tenant-specific over AllTenants base
+                                    # Merge group-based over AllTenants base
                                     $MergedStandard = Merge-CippStandards -Existing $ComputedStandards[$Key] -New $CurrentStandard -StandardName $StandardName
                                     $ComputedStandards[$Key] = $MergedStandard
                                 } else {
@@ -399,13 +436,100 @@ function Get-CIPPStandards {
                 }
             }
 
-            # Emit one object per unique (StandardName, TemplateList.value)
+            # Process TenantSpecific templates, merging with Group and AllTenants base
+            foreach ($Template in $TenantSpecificTemplatesSet) {
+                $Standards = $Template.standards
+
+                foreach ($StandardName in $Standards.PSObject.Properties.Name) {
+                    $Value = $Standards.$StandardName
+                    if ($null -eq $Value) { continue }
+                    $IsArray = $Value -is [System.Collections.IEnumerable] -and -not ($Value -is [string])
+
+                    if ($IsArray) {
+                        foreach ($Item in $Value) {
+                            $CurrentStandard = $Item.PSObject.Copy()
+                            $CurrentStandard | Add-Member -NotePropertyName 'TemplateId' -NotePropertyValue $Template.GUID -Force
+
+                            # Add Remediate if autoRemediate is true
+                            if ($CurrentStandard.autoRemediate -eq $true -and -not ($CurrentStandard.action.value -contains 'Remediate')) {
+                                $CurrentStandard.action = @($CurrentStandard.action) + [pscustomobject]@{
+                                    label = 'Remediate'
+                                    value = 'Remediate'
+                                }
+                            }
+
+                            # Add Report if Remediate present but Report missing
+                            if ($CurrentStandard.action.value -contains 'Remediate' -and -not ($CurrentStandard.action.value -contains 'Report')) {
+                                $CurrentStandard.action = @($CurrentStandard.action) + [pscustomobject]@{
+                                    label = 'Report'
+                                    value = 'Report'
+                                }
+                            }
+
+                            $Actions = $CurrentStandard.action.value
+                            if ($Actions -contains 'Remediate' -or $Actions -contains 'warn' -or $Actions -contains 'Report') {
+                                $TemplateKey = if ($CurrentStandard.TemplateList.value) { $CurrentStandard.TemplateList.value } elseif ($CurrentStandard.displayName.value) { $CurrentStandard.displayName.value } elseif ($CurrentStandard.displayName) { $CurrentStandard.displayName } else { [guid]::NewGuid().ToString() }
+                                $Key = "$StandardName|$TemplateKey"
+
+                                if ($ComputedStandards.ContainsKey($Key)) {
+                                    # Merge tenant-specific over Group/AllTenants base
+                                    $MergedStandard = Merge-CippStandards -Existing $ComputedStandards[$Key] -New $CurrentStandard -StandardName $StandardName
+                                    $ComputedStandards[$Key] = $MergedStandard
+                                } else {
+                                    $ComputedStandards[$Key] = $CurrentStandard
+                                }
+                            }
+                        }
+                    } else {
+                        $CurrentStandard = $Value.PSObject.Copy()
+                        $CurrentStandard | Add-Member -NotePropertyName 'TemplateId' -NotePropertyValue $Template.GUID -Force
+
+                        # Add Remediate if autoRemediate is true
+                        if ($CurrentStandard.autoRemediate -eq $true -and -not ($CurrentStandard.action.value -contains 'Remediate')) {
+                            $CurrentStandard.action = @($CurrentStandard.action) + [pscustomobject]@{
+                                label = 'Remediate'
+                                value = 'Remediate'
+                            }
+                        }
+
+                        # Add Report if Remediate present but Report missing
+                        if ($CurrentStandard.action.value -contains 'Remediate' -and -not ($CurrentStandard.action.value -contains 'Report')) {
+                            $CurrentStandard.action = @($CurrentStandard.action) + [pscustomobject]@{
+                                label = 'Report'
+                                value = 'Report'
+                            }
+                        }
+
+                        $Actions = $CurrentStandard.action.value
+                        if ($Actions -contains 'Remediate' -or $Actions -contains 'warn' -or $Actions -contains 'Report') {
+                            $TemplateKey = if ($CurrentStandard.TemplateList.value) { $CurrentStandard.TemplateList.value } else { '' }
+                            $Key = "$StandardName|$TemplateKey"
+
+                            if ($ComputedStandards.ContainsKey($Key)) {
+                                $MergedStandard = Merge-CippStandards -Existing $ComputedStandards[$Key] -New $CurrentStandard -StandardName $StandardName
+                                $ComputedStandards[$Key] = $MergedStandard
+                            } else {
+                                $ComputedStandards[$Key] = $CurrentStandard
+                            }
+                        }
+                    }
+                }
+            }
+            # License checks and policy timestamp filtering moved to Push-CIPPStandardsList activity
             foreach ($Key in $ComputedStandards.Keys) {
                 $Standard = $ComputedStandards[$Key]
                 $StandardName = $Key -replace '\|.*$', ''
-
                 # Preserve TemplateId before removing
                 $PreservedTemplateId = $Standard.TemplateId
+
+                # When a specific TemplateId was requested, only emit standards that
+                # this template actually won after the three-tier merge. This prevents
+                # a group template manual run from executing standards that a
+                # tenant-specific template has overridden.
+                if ($TemplateId -ne '*' -and $PreservedTemplateId -notlike $TemplateId) {
+                    continue
+                }
+
                 $Standard.PSObject.Properties.Remove('TemplateId') | Out-Null
 
                 $Normalized = ConvertTo-CippStandardObject $Standard
@@ -420,4 +544,3 @@ function Get-CIPPStandards {
         }
     }
 }
-
